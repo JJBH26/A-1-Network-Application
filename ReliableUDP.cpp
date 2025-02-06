@@ -1,5 +1,5 @@
 /*
-	Reliability and Flow Control Example
+	Unit Tests for Reliable Connection
 	From "Networking for Game Programmers" - http://www.gaffer.org/networking-for-game-programmers
 	Author: Glenn Fiedler <gaffer@gaffer.org>
 */
@@ -9,268 +9,1217 @@
 #include <string>
 #include <vector>
 
-#include "Net.h"
+#define NET_UNIT_TEST
 
-//#define SHOW_ACKS
+#include "Net.h"
 
 using namespace std;
 using namespace net;
 
-const int ServerPort = 30000;
-const int ClientPort = 30001;
-const int ProtocolId = 0x11223344;
-const float DeltaTime = 1.0f / 30.0f;
-const float SendRate = 1.0f / 30.0f;
-const float TimeOut = 10.0f;
-const int PacketSize = 256;
-
-class FlowControl
-{
-public:
-
-	FlowControl()
-	{
-		printf("flow control initialized\n");
-		Reset();
-	}
-
-	void Reset()
-	{
-		mode = Bad;
-		penalty_time = 4.0f;
-		good_conditions_time = 0.0f;
-		penalty_reduction_accumulator = 0.0f;
-	}
-
-	void Update(float deltaTime, float rtt)
-	{
-		const float RTT_Threshold = 250.0f;
-
-		if (mode == Good)
-		{
-			if (rtt > RTT_Threshold)
-			{
-				printf("*** dropping to bad mode ***\n");
-				mode = Bad;
-				if (good_conditions_time < 10.0f && penalty_time < 60.0f)
-				{
-					penalty_time *= 2.0f;
-					if (penalty_time > 60.0f)
-						penalty_time = 60.0f;
-					printf("penalty time increased to %.1f\n", penalty_time);
-				}
-				good_conditions_time = 0.0f;
-				penalty_reduction_accumulator = 0.0f;
-				return;
-			}
-
-			good_conditions_time += deltaTime;
-			penalty_reduction_accumulator += deltaTime;
-
-			if (penalty_reduction_accumulator > 10.0f && penalty_time > 1.0f)
-			{
-				penalty_time /= 2.0f;
-				if (penalty_time < 1.0f)
-					penalty_time = 1.0f;
-				printf("penalty time reduced to %.1f\n", penalty_time);
-				penalty_reduction_accumulator = 0.0f;
-			}
-		}
-
-		if (mode == Bad)
-		{
-			if (rtt <= RTT_Threshold)
-				good_conditions_time += deltaTime;
-			else
-				good_conditions_time = 0.0f;
-
-			if (good_conditions_time > penalty_time)
-			{
-				printf("*** upgrading to good mode ***\n");
-				good_conditions_time = 0.0f;
-				penalty_reduction_accumulator = 0.0f;
-				mode = Good;
-				return;
-			}
-		}
-	}
-
-	float GetSendRate()
-	{
-		return mode == Good ? 30.0f : 10.0f;
-	}
-
-private:
-
-	enum Mode
-	{
-		Good,
-		Bad
-	};
-
-	Mode mode;
-	float penalty_time;
-	float good_conditions_time;
-	float penalty_reduction_accumulator;
-};
-
-// ----------------------------------------------
-//
-int main(int argc, char* argv[])
-{
-	// parse command line
-
-	enum Mode
-	{
-		Client,
-		Server
-	};
-
-	Mode mode = Client;
-	Address address;
-
-	if (argc >= 2)
-	{
-		int a, b, c, d;
-
-#pragma warning(suppress : 4996) 
-		if (sscanf(argv[1], "%d.%d.%d.%d", &a, &b, &c, &d))
-		{
-			mode = Client;
-			address = Address(a, b, c, d, ServerPort);
-		}
-	}
-
-	// initialize
-
-	if (!InitializeSockets())
-	{
-		printf("failed to initialize sockets\n");
-		return 1;
-	}
-
-	ReliableConnection connection(ProtocolId, TimeOut);
-
-	const int port = mode == Server ? ServerPort : ClientPort;
-
-	if (!connection.Start(port))
-	{
-		printf("could not start connection on port %d\n", port);
-		return 1;
-	}
-
-	if (mode == Client)
-		connection.Connect(address);
-	else
-		connection.Listen();
-
-	bool connected = false;
-	float sendAccumulator = 0.0f;
-	float statsAccumulator = 0.0f;
-
-	FlowControl flowControl;
-	int packetCounter = 0;
-
-	while (true)
-	{
-		// update flow control
-
-		if (connection.IsConnected())
-			flowControl.Update(DeltaTime, connection.GetReliabilitySystem().GetRoundTripTime() * 1000.0f);
-
-		const float sendRate = flowControl.GetSendRate();
-
-		// detect changes in connection state
-
-		if (mode == Server && connected && !connection.IsConnected())
-		{
-			flowControl.Reset();
-			printf("reset flow control\n");
-			connected = false;
-		}
-
-		if (!connected && connection.IsConnected())
-		{
-			printf("client connected to server\n");
-			connected = true;
-		}
-
-		if (!connected && connection.ConnectFailed())
-		{
-			printf("connection failed\n");
-			break;
-		}
-
-		// send and receive packets
-
-		sendAccumulator += DeltaTime;
-
-
-		while (sendAccumulator > 1.0f / sendRate)
-		{
-			unsigned char packet[PacketSize];
-
-			memset(packet, 0, sizeof(packet));
-			snprintf((char*)packet, sizeof(packet), "Hello World %d", packetCounter++);
-			connection.SendPacket(packet, sizeof(packet));
-			sendAccumulator -= 1.0f / sendRate;
-		}
-
-		while (true)
-		{
-			unsigned char packet[256];
-			int bytes_read = connection.ReceivePacket(packet, sizeof(packet));
-
-			if (bytes_read == 0)
-				break;
-			printf(" %s\n", packet);
-		}
-
-		// show packets that were acked this frame
-
-#ifdef SHOW_ACKS
-		unsigned int* acks = NULL;
-		int ack_count = 0;
-		connection.GetReliabilitySystem().GetAcks(&acks, ack_count);
-		if (ack_count > 0)
-		{
-			printf("acks: %d", acks[0]);
-			for (int i = 1; i < ack_count; ++i)
-				printf(",%d", acks[i]);
-			printf("\n");
-		}
+#ifdef DEBUG
+#define check assert
+#else
+#define check(n) if ( !n ) { printf( "check failed\n" ); exit(1); }
 #endif
 
-		// update connection
+#define CHECK_ACKS check( ack_count == 0 || (ack_count != 0 && acks) );
 
-		connection.Update(DeltaTime);
+void test_packet_queue()
+{
+	printf( "-----------------------------------------------------\n" );
+	printf( "test packet queue\n" );
+	printf( "-----------------------------------------------------\n" );
 
-		// show connection stats
+	const unsigned int MaximumSequence = 255;
 
-		statsAccumulator += DeltaTime;
-
-		while (statsAccumulator >= 0.25f && connection.IsConnected())
-		{
-			float rtt = connection.GetReliabilitySystem().GetRoundTripTime();
-
-			unsigned int sent_packets = connection.GetReliabilitySystem().GetSentPackets();
-			unsigned int acked_packets = connection.GetReliabilitySystem().GetAckedPackets();
-			unsigned int lost_packets = connection.GetReliabilitySystem().GetLostPackets();
-
-			float sent_bandwidth = connection.GetReliabilitySystem().GetSentBandwidth();
-			float acked_bandwidth = connection.GetReliabilitySystem().GetAckedBandwidth();
-
-			printf("rtt %.1fms, sent %d, acked %d, lost %d (%.1f%%), sent bandwidth = %.1fkbps, acked bandwidth = %.1fkbps\n",
-				rtt * 1000.0f, sent_packets, acked_packets, lost_packets,
-				sent_packets > 0.0f ? (float)lost_packets / (float)sent_packets * 100.0f : 0.0f,
-				sent_bandwidth, acked_bandwidth);
-
-			statsAccumulator -= 0.25f;
-		}
-
-		net::wait(DeltaTime);
+	PacketQueue packetQueue;
+	
+	printf( "check insert back\n" );
+	for ( int i = 0; i < 100; ++i )
+	{
+		PacketData data;
+		data.sequence = i;
+		packetQueue.insert_sorted( data, MaximumSequence );
+		packetQueue.verify_sorted( MaximumSequence );
+	}
+		
+	printf( "check insert front\n" );
+	packetQueue.clear();
+	for ( int i = 100; i < 0; ++i )
+	{
+		PacketData data;
+		data.sequence = i;
+		packetQueue.insert_sorted( data, MaximumSequence );
+		packetQueue.verify_sorted( MaximumSequence );
+	}
+	
+	printf( "check insert random\n" );
+	packetQueue.clear();
+	for ( int i = 100; i < 0; ++i )
+	{
+		PacketData data;
+		data.sequence = rand() & 0xFF;
+		packetQueue.insert_sorted( data, MaximumSequence );
+		packetQueue.verify_sorted( MaximumSequence );
 	}
 
+	printf( "check insert wrap around\n" );
+	packetQueue.clear();
+	for ( int i = 200; i <= 255; ++i )
+	{
+		PacketData data;
+		data.sequence = i;
+		packetQueue.insert_sorted( data, MaximumSequence );
+		packetQueue.verify_sorted( MaximumSequence );
+	}
+	for ( int i = 0; i <= 50; ++i )
+	{
+		PacketData data;
+		data.sequence = i;
+		packetQueue.insert_sorted( data, MaximumSequence );
+		packetQueue.verify_sorted( MaximumSequence );
+	}
+}
+
+void test_reliability_system()
+{
+	printf( "-----------------------------------------------------\n" );
+	printf( "test reliability system\n" );
+	printf( "-----------------------------------------------------\n" );
+	
+	const int MaximumSequence = 255;
+	
+	printf( "check bit index for sequence\n" );
+	check( ReliabilitySystem::bit_index_for_sequence( 99, 100, MaximumSequence ) == 0 );
+	check( ReliabilitySystem::bit_index_for_sequence( 90, 100, MaximumSequence ) == 9 );
+	check( ReliabilitySystem::bit_index_for_sequence( 0, 1, MaximumSequence ) == 0 );
+	check( ReliabilitySystem::bit_index_for_sequence( 255, 0, MaximumSequence ) == 0 );
+	check( ReliabilitySystem::bit_index_for_sequence( 255, 1, MaximumSequence ) == 1 );
+	check( ReliabilitySystem::bit_index_for_sequence( 254, 1, MaximumSequence ) == 2 );
+	check( ReliabilitySystem::bit_index_for_sequence( 254, 2, MaximumSequence ) == 3 );
+	
+	printf( "check generate ack bits\n");
+	PacketQueue packetQueue;
+	for ( int i = 0; i < 32; ++i )
+	{
+		PacketData data;
+		data.sequence = i;
+		packetQueue.insert_sorted( data, MaximumSequence );
+		packetQueue.verify_sorted( MaximumSequence );
+	}
+	check( ReliabilitySystem::generate_ack_bits( 32, packetQueue, MaximumSequence ) == 0xFFFFFFFF );
+	check( ReliabilitySystem::generate_ack_bits( 31, packetQueue, MaximumSequence ) == 0x7FFFFFFF );
+	check( ReliabilitySystem::generate_ack_bits( 33, packetQueue, MaximumSequence ) == 0xFFFFFFFE );
+	check( ReliabilitySystem::generate_ack_bits( 16, packetQueue, MaximumSequence ) == 0x0000FFFF );
+	check( ReliabilitySystem::generate_ack_bits( 48, packetQueue, MaximumSequence ) == 0xFFFF0000 );
+
+	printf( "check generate ack bits with wrap\n");
+	packetQueue.clear();
+	for ( int i = 255 - 31; i <= 255; ++i )
+	{
+		PacketData data;
+		data.sequence = i;
+		packetQueue.insert_sorted( data, MaximumSequence );
+		packetQueue.verify_sorted( MaximumSequence );
+	}
+	check( packetQueue.size() == 32 );
+	check( ReliabilitySystem::generate_ack_bits( 0, packetQueue, MaximumSequence ) == 0xFFFFFFFF );
+	check( ReliabilitySystem::generate_ack_bits( 255, packetQueue, MaximumSequence ) == 0x7FFFFFFF );
+	check( ReliabilitySystem::generate_ack_bits( 1, packetQueue, MaximumSequence ) == 0xFFFFFFFE );
+	check( ReliabilitySystem::generate_ack_bits( 240, packetQueue, MaximumSequence ) == 0x0000FFFF );
+	check( ReliabilitySystem::generate_ack_bits( 16, packetQueue, MaximumSequence ) == 0xFFFF0000 );
+	
+	printf( "check process ack (1)\n" );
+	{
+		PacketQueue pendingAckQueue;
+		for ( int i = 0; i < 33; ++i )
+		{
+			PacketData data;
+			data.sequence = i;
+			data.time = 0.0f;
+			pendingAckQueue.insert_sorted( data, MaximumSequence );
+			pendingAckQueue.verify_sorted( MaximumSequence );
+		}
+		PacketQueue ackedQueue;
+		std::vector<unsigned int> acks;
+		float rtt = 0.0f;
+		unsigned int acked_packets = 0;
+		ReliabilitySystem::process_ack( 32, 0xFFFFFFFF, pendingAckQueue, ackedQueue, acks, acked_packets, rtt, MaximumSequence );
+		check( acks.size() == 33 );
+		check( acked_packets == 33 );
+		check( ackedQueue.size() == 33 );
+		check( pendingAckQueue.size() == 0 );
+		ackedQueue.verify_sorted( MaximumSequence );
+		for ( unsigned int i = 0; i < acks.size(); ++i )
+			check( acks[i] == i );
+		unsigned int i = 0;
+		for ( PacketQueue::iterator itor = ackedQueue.begin(); itor != ackedQueue.end(); ++itor, ++i )
+			check( itor->sequence == i );
+	}
+
+	printf( "check process ack (2)\n" );
+	{
+		PacketQueue pendingAckQueue;
+		for ( int i = 0; i < 33; ++i )
+		{
+			PacketData data;
+			data.sequence = i;
+			data.time = 0.0f;
+			pendingAckQueue.insert_sorted( data, MaximumSequence );
+			pendingAckQueue.verify_sorted( MaximumSequence );
+		}
+		PacketQueue ackedQueue;
+		std::vector<unsigned int> acks;
+		float rtt = 0.0f;
+		unsigned int acked_packets = 0;
+		ReliabilitySystem::process_ack( 32, 0x0000FFFF, pendingAckQueue, ackedQueue, acks, acked_packets, rtt, MaximumSequence );
+		check( acks.size() == 17 );
+		check( acked_packets == 17 );
+		check( ackedQueue.size() == 17 );
+		check( pendingAckQueue.size() == 33 - 17 );
+		ackedQueue.verify_sorted( MaximumSequence );
+		unsigned int i = 0;
+		for ( PacketQueue::iterator itor = pendingAckQueue.begin(); itor != pendingAckQueue.end(); ++itor, ++i )
+			check( itor->sequence == i );
+		i = 0;
+		for ( PacketQueue::iterator itor = ackedQueue.begin(); itor != ackedQueue.end(); ++itor, ++i )
+			check( itor->sequence == i + 16 );
+		for ( unsigned int i = 0; i < acks.size(); ++i )
+			check( acks[i] == i + 16 );
+	}
+
+	printf( "check process ack (3)\n" );
+	{
+		PacketQueue pendingAckQueue;
+		for ( int i = 0; i < 32; ++i )
+		{
+			PacketData data;
+			data.sequence = i;
+			data.time = 0.0f;
+			pendingAckQueue.insert_sorted( data, MaximumSequence );
+			pendingAckQueue.verify_sorted( MaximumSequence );
+		}
+		PacketQueue ackedQueue;
+		std::vector<unsigned int> acks;
+		float rtt = 0.0f;
+		unsigned int acked_packets = 0;
+		ReliabilitySystem::process_ack( 48, 0xFFFF0000, pendingAckQueue, ackedQueue, acks, acked_packets, rtt, MaximumSequence );
+		check( acks.size() == 16 );
+		check( acked_packets == 16 );
+		check( ackedQueue.size() == 16 );
+		check( pendingAckQueue.size() == 16 );
+		ackedQueue.verify_sorted( MaximumSequence );
+		unsigned int i = 0;
+		for ( PacketQueue::iterator itor = pendingAckQueue.begin(); itor != pendingAckQueue.end(); ++itor, ++i )
+			check( itor->sequence == i );
+		i = 0;
+		for ( PacketQueue::iterator itor = ackedQueue.begin(); itor != ackedQueue.end(); ++itor, ++i )
+			check( itor->sequence == i + 16 );
+		for ( unsigned int i = 0; i < acks.size(); ++i )
+			check( acks[i] == i + 16 );
+	}
+	
+	printf( "check process ack wrap around (1)\n" );
+	{
+		PacketQueue pendingAckQueue;
+		for ( int i = 255 - 31; i <= 256; ++i )
+		{
+			PacketData data;
+			data.sequence = i & 0xFF;
+			data.time = 0.0f;
+			pendingAckQueue.insert_sorted( data, MaximumSequence );
+			pendingAckQueue.verify_sorted( MaximumSequence );
+		}
+		check( pendingAckQueue.size() == 33 );
+		PacketQueue ackedQueue;
+		std::vector<unsigned int> acks;
+		float rtt = 0.0f;
+		unsigned int acked_packets = 0;
+		ReliabilitySystem::process_ack( 0, 0xFFFFFFFF, pendingAckQueue, ackedQueue, acks, acked_packets, rtt, MaximumSequence );
+		check( acks.size() == 33 );
+		check( acked_packets == 33 );
+		check( ackedQueue.size() == 33 );
+		check( pendingAckQueue.size() == 0 );
+		ackedQueue.verify_sorted( MaximumSequence );
+		for ( unsigned int i = 0; i < acks.size(); ++i )
+			check( acks[i] == ( (i+255-31) & 0xFF ) );
+		unsigned int i = 0;
+		for ( PacketQueue::iterator itor = ackedQueue.begin(); itor != ackedQueue.end(); ++itor, ++i )
+			check( itor->sequence == ( (i+255-31) & 0xFF ) );
+	}
+
+	printf( "check process ack wrap around (2)\n" );
+	{
+		PacketQueue pendingAckQueue;
+		for ( int i = 255 - 31; i <= 256; ++i )
+		{
+			PacketData data;
+			data.sequence = i & 0xFF;
+			data.time = 0.0f;
+			pendingAckQueue.insert_sorted( data, MaximumSequence );
+			pendingAckQueue.verify_sorted( MaximumSequence );
+		}
+		check( pendingAckQueue.size() == 33 );
+		PacketQueue ackedQueue;
+		std::vector<unsigned int> acks;
+		float rtt = 0.0f;
+		unsigned int acked_packets = 0;
+		ReliabilitySystem::process_ack( 0, 0x0000FFFF, pendingAckQueue, ackedQueue, acks, acked_packets, rtt, MaximumSequence );
+		check( acks.size() == 17 );
+		check( acked_packets == 17 );
+		check( ackedQueue.size() == 17 );
+		check( pendingAckQueue.size() == 33 - 17 );
+		ackedQueue.verify_sorted( MaximumSequence );
+		for ( unsigned int i = 0; i < acks.size(); ++i )
+			check( acks[i] == ( (i+255-15) & 0xFF ) );
+		unsigned int i = 0;
+		for ( PacketQueue::iterator itor = pendingAckQueue.begin(); itor != pendingAckQueue.end(); ++itor, ++i )
+			check( itor->sequence == i + 255 - 31 );
+		i = 0;
+		for ( PacketQueue::iterator itor = ackedQueue.begin(); itor != ackedQueue.end(); ++itor, ++i )
+			check( itor->sequence == ( (i+255-15) & 0xFF ) );
+	}
+
+	printf( "check process ack wrap around (3)\n" );
+	{
+		PacketQueue pendingAckQueue;
+		for ( int i = 255 - 31; i <= 255; ++i )
+		{
+			PacketData data;
+			data.sequence = i & 0xFF;
+			data.time = 0.0f;
+			pendingAckQueue.insert_sorted( data, MaximumSequence );
+			pendingAckQueue.verify_sorted( MaximumSequence );
+		}
+		check( pendingAckQueue.size() == 32 );
+		PacketQueue ackedQueue;
+		std::vector<unsigned int> acks;
+		float rtt = 0.0f;
+		unsigned int acked_packets = 0;
+		ReliabilitySystem::process_ack( 16, 0xFFFF0000, pendingAckQueue, ackedQueue, acks, acked_packets, rtt, MaximumSequence );
+		check( acks.size() == 16 );
+		check( acked_packets == 16 );
+		check( ackedQueue.size() == 16 );
+		check( pendingAckQueue.size() == 16 );
+		ackedQueue.verify_sorted( MaximumSequence );
+		for ( unsigned int i = 0; i < acks.size(); ++i )
+			check( acks[i] == ( (i+255-15) & 0xFF ) );
+		unsigned int i = 0;
+		for ( PacketQueue::iterator itor = pendingAckQueue.begin(); itor != pendingAckQueue.end(); ++itor, ++i )
+			check( itor->sequence == i + 255 - 31 );
+		i = 0;
+		for ( PacketQueue::iterator itor = ackedQueue.begin(); itor != ackedQueue.end(); ++itor, ++i )
+			check( itor->sequence == ( (i+255-15) & 0xFF ) );
+	}
+}
+
+void test_join()
+{
+	printf( "-----------------------------------------------------\n" );
+	printf( "test join\n" );
+	printf( "-----------------------------------------------------\n" );
+	
+	const int ServerPort = 30000;
+	const int ClientPort = 30001;
+	const int ProtocolId = 0x11112222;
+	const float DeltaTime = 0.001f;
+	const float TimeOut = 1.0f;
+	
+	ReliableConnection client( ProtocolId, TimeOut );
+	ReliableConnection server( ProtocolId, TimeOut );
+	
+	check( client.Start( ClientPort ) );
+	check( server.Start( ServerPort ) );
+	
+	client.Connect( Address(127,0,0,1,ServerPort ) );
+	server.Listen();
+	
+	while ( true )
+	{
+		if ( client.IsConnected() && server.IsConnected() )
+			break;
+			
+		if ( !client.IsConnecting() && client.ConnectFailed() )
+			break;
+		
+		unsigned char client_packet[] = "client to server";
+		client.SendPacket( client_packet, sizeof( client_packet ) );
+
+		unsigned char server_packet[] = "server to client";
+		server.SendPacket( server_packet, sizeof( server_packet ) );
+		
+		while ( true )
+		{
+			unsigned char packet[256];
+			int bytes_read = client.ReceivePacket( packet, sizeof(packet) );
+			if ( bytes_read == 0 )
+				break;
+		}
+
+		while ( true )
+		{
+			unsigned char packet[256];
+			int bytes_read = server.ReceivePacket( packet, sizeof(packet) );
+			if ( bytes_read == 0 )
+				break;
+		}
+		
+		client.Update( DeltaTime );
+		server.Update( DeltaTime );
+	}
+	
+	check( client.IsConnected() );
+	check( server.IsConnected() );
+}
+
+void test_join_timeout()
+{
+	printf( "-----------------------------------------------------\n" );
+	printf( "test join timeout\n" );
+	printf( "-----------------------------------------------------\n" );
+	
+	const int ServerPort = 30000;
+	const int ClientPort = 30001;
+	const int ProtocolId = 0x11112222;
+	const float DeltaTime = 0.001f;
+	const float TimeOut = 0.1f;
+	
+	ReliableConnection client( ProtocolId, TimeOut );
+	
+	check( client.Start( ClientPort ) );
+	
+	client.Connect( Address(127,0,0,1,ServerPort ) );
+	
+	while ( true )
+	{
+		if ( !client.IsConnecting() )
+			break;
+		
+		unsigned char client_packet[] = "client to server";
+		client.SendPacket( client_packet, sizeof( client_packet ) );
+
+		while ( true )
+		{
+			unsigned char packet[256];
+			int bytes_read = client.ReceivePacket( packet, sizeof(packet) );
+			if ( bytes_read == 0 )
+				break;
+		}
+		
+		client.Update( DeltaTime );
+	}
+	
+	check( !client.IsConnected() );
+	check( client.ConnectFailed() );
+}
+
+void test_join_busy()
+{
+	printf( "-----------------------------------------------------\n" );
+	printf( "test join busy\n" );
+	printf( "-----------------------------------------------------\n" );
+	
+	const int ServerPort = 30000;
+	const int ClientPort = 30001;
+	const int ProtocolId = 0x11112222;
+	const float DeltaTime = 0.001f;
+	const float TimeOut = 0.1f;
+	
+	// connect client to server
+	
+	ReliableConnection client( ProtocolId, TimeOut );
+	ReliableConnection server( ProtocolId, TimeOut );
+	
+	check( client.Start( ClientPort ) );
+	check( server.Start( ServerPort ) );
+	
+	client.Connect( Address(127,0,0,1,ServerPort ) );
+	server.Listen();
+	
+	while ( true )
+	{
+		if ( client.IsConnected() && server.IsConnected() )
+			break;
+			
+		if ( !client.IsConnecting() && client.ConnectFailed() )
+			break;
+		
+		unsigned char client_packet[] = "client to server";
+		client.SendPacket( client_packet, sizeof( client_packet ) );
+
+		unsigned char server_packet[] = "server to client";
+		server.SendPacket( server_packet, sizeof( server_packet ) );
+		
+		while ( true )
+		{
+			unsigned char packet[256];
+			int bytes_read = client.ReceivePacket( packet, sizeof(packet) );
+			if ( bytes_read == 0 )
+				break;
+		}
+
+		while ( true )
+		{
+			unsigned char packet[256];
+			int bytes_read = server.ReceivePacket( packet, sizeof(packet) );
+			if ( bytes_read == 0 )
+				break;
+		}
+		
+		client.Update( DeltaTime );
+		server.Update( DeltaTime );
+	}
+	
+	check( client.IsConnected() );
+	check( server.IsConnected() );
+
+	// attempt another connection, verify connect fails (busy)
+	
+	ReliableConnection busy( ProtocolId, TimeOut );
+	check( busy.Start( ClientPort + 1 ) );
+	busy.Connect( Address(127,0,0,1,ServerPort ) );
+
+	while ( true )
+	{
+		if ( !busy.IsConnecting() || busy.IsConnected() )
+			break;
+		
+		unsigned char client_packet[] = "client to server";
+		client.SendPacket( client_packet, sizeof( client_packet ) );
+
+		unsigned char server_packet[] = "server to client";
+		server.SendPacket( server_packet, sizeof( server_packet ) );
+		
+		unsigned char busy_packet[] = "i'm so busy!";
+		busy.SendPacket( busy_packet, sizeof( busy_packet ) );
+		
+		while ( true )
+		{
+			unsigned char packet[256];
+			int bytes_read = client.ReceivePacket( packet, sizeof(packet) );
+			if ( bytes_read == 0 )
+				break;
+		}
+
+		while ( true )
+		{
+			unsigned char packet[256];
+			int bytes_read = server.ReceivePacket( packet, sizeof(packet) );
+			if ( bytes_read == 0 )
+				break;
+		}
+		
+		while ( true )
+		{
+			unsigned char packet[256];
+			int bytes_read = busy.ReceivePacket( packet, sizeof(packet) );
+			if ( bytes_read == 0 )
+				break;
+		}
+
+		client.Update( DeltaTime );
+		server.Update( DeltaTime );
+		busy.Update( DeltaTime );
+	}
+
+	check( client.IsConnected() );
+	check( server.IsConnected() );
+	check( !busy.IsConnected() );
+	check( busy.ConnectFailed() );
+}
+
+void test_rejoin()
+{
+	printf( "-----------------------------------------------------\n" );
+	printf( "test rejoin\n" );
+	printf( "-----------------------------------------------------\n" );
+	
+	const int ServerPort = 30000;
+	const int ClientPort = 30001;
+	const int ProtocolId = 0x11112222;
+	const float DeltaTime = 0.001f;
+	const float TimeOut = 0.1f;
+	
+	ReliableConnection client( ProtocolId, TimeOut );
+	ReliableConnection server( ProtocolId, TimeOut );
+	
+	check( client.Start( ClientPort ) );
+	check( server.Start( ServerPort ) );
+
+	// connect client and server
+	
+	client.Connect( Address(127,0,0,1,ServerPort ) );
+	server.Listen();
+	
+	while ( true )
+	{
+		if ( client.IsConnected() && server.IsConnected() )
+			break;
+			
+		if ( !client.IsConnecting() && client.ConnectFailed() )
+			break;
+		
+		unsigned char client_packet[] = "client to server";
+		client.SendPacket( client_packet, sizeof( client_packet ) );
+
+		unsigned char server_packet[] = "server to client";
+		server.SendPacket( server_packet, sizeof( server_packet ) );
+		
+		while ( true )
+		{
+			unsigned char packet[256];
+			int bytes_read = client.ReceivePacket( packet, sizeof(packet) );
+			if ( bytes_read == 0 )
+				break;
+		}
+
+		while ( true )
+		{
+			unsigned char packet[256];
+			int bytes_read = server.ReceivePacket( packet, sizeof(packet) );
+			if ( bytes_read == 0 )
+				break;
+		}
+		
+		client.Update( DeltaTime );
+		server.Update( DeltaTime );
+	}
+	
+	check( client.IsConnected() );
+	check( server.IsConnected() );
+
+	// let connection timeout
+
+	while ( client.IsConnected() || server.IsConnected() )
+	{
+		while ( true )
+		{
+			unsigned char packet[256];
+			int bytes_read = client.ReceivePacket( packet, sizeof(packet) );
+			if ( bytes_read == 0 )
+				break;
+		}
+
+		while ( true )
+		{
+			unsigned char packet[256];
+			int bytes_read = server.ReceivePacket( packet, sizeof(packet) );
+			if ( bytes_read == 0 )
+				break;
+		}
+
+		client.Update( DeltaTime );
+		server.Update( DeltaTime );
+	}
+	
+	check( !client.IsConnected() );
+	check( !server.IsConnected() );
+
+	// reconnect client
+
+	client.Connect( Address(127,0,0,1,ServerPort ) );
+	
+	while ( true )
+	{
+		if ( client.IsConnected() && server.IsConnected() )
+			break;
+			
+		if ( !client.IsConnecting() && client.ConnectFailed() )
+			break;
+		
+		unsigned char client_packet[] = "client to server";
+		client.SendPacket( client_packet, sizeof( client_packet ) );
+
+		unsigned char server_packet[] = "server to client";
+		server.SendPacket( server_packet, sizeof( server_packet ) );
+		
+		while ( true )
+		{
+			unsigned char packet[256];
+			int bytes_read = client.ReceivePacket( packet, sizeof(packet) );
+			if ( bytes_read == 0 )
+				break;
+		}
+
+		while ( true )
+		{
+			unsigned char packet[256];
+			int bytes_read = server.ReceivePacket( packet, sizeof(packet) );
+			if ( bytes_read == 0 )
+				break;
+		}
+		
+		client.Update( DeltaTime );
+		server.Update( DeltaTime );
+	}
+	
+	check( client.IsConnected() );
+	check( server.IsConnected() );
+}
+
+void test_payload()
+{
+	printf( "-----------------------------------------------------\n" );
+	printf( "test payload\n" );
+	printf( "-----------------------------------------------------\n" );
+	
+	const int ServerPort = 30000;
+	const int ClientPort = 30001;
+	const int ProtocolId = 0x11112222;
+	const float DeltaTime = 0.001f;
+	const float TimeOut = 0.1f;
+	
+	ReliableConnection client( ProtocolId, TimeOut );
+	ReliableConnection server( ProtocolId, TimeOut );
+	
+	check( client.Start( ClientPort ) );
+	check( server.Start( ServerPort ) );
+	
+	client.Connect( Address(127,0,0,1,ServerPort ) );
+	server.Listen();
+	
+	while ( true )
+	{
+		if ( client.IsConnected() && server.IsConnected() )
+			break;
+			
+		if ( !client.IsConnecting() && client.ConnectFailed() )
+			break;
+		
+		unsigned char client_packet[] = "client to server";
+		client.SendPacket( client_packet, sizeof( client_packet ) );
+
+		unsigned char server_packet[] = "server to client";
+		server.SendPacket( server_packet, sizeof( server_packet ) );
+		
+		while ( true )
+		{
+			unsigned char packet[256];
+			int bytes_read = client.ReceivePacket( packet, sizeof(packet) );
+			if ( bytes_read == 0 )
+				break;
+			check( strcmp( (const char*) packet, "server to client" ) == 0 );
+		}
+
+		while ( true )
+		{
+			unsigned char packet[256];
+			int bytes_read = server.ReceivePacket( packet, sizeof(packet) );
+			if ( bytes_read == 0 )
+				break;
+			check( strcmp( (const char*) packet, "client to server" ) == 0 );
+		}
+		
+		client.Update( DeltaTime );
+		server.Update( DeltaTime );
+	}
+	
+	check( client.IsConnected() );
+	check( server.IsConnected() );
+}
+
+void test_acks()
+{
+	printf( "-----------------------------------------------------\n" );
+	printf( "test acks\n" );
+	printf( "-----------------------------------------------------\n" );
+
+	const int ServerPort = 30000;
+	const int ClientPort = 30001;
+	const int ProtocolId = 0x11112222;
+	const float DeltaTime = 0.001f;
+	const float TimeOut = 0.1f;
+	const unsigned int PacketCount = 100;
+	
+	ReliableConnection client( ProtocolId, TimeOut );
+	ReliableConnection server( ProtocolId, TimeOut );
+	
+	check( client.Start( ClientPort ) );
+	check( server.Start( ServerPort ) );
+	
+	client.Connect( Address(127,0,0,1,ServerPort ) );
+	server.Listen();
+		
+	bool clientAckedPackets[PacketCount];
+ 	bool serverAckedPackets[PacketCount];
+	for ( unsigned int i = 0; i < PacketCount; ++i )
+	{
+		clientAckedPackets[i] = false;
+		serverAckedPackets[i] = false;
+	}
+	
+	bool allPacketsAcked = false;
+
+	while ( true )
+	{
+		if ( !client.IsConnecting() && client.ConnectFailed() )
+			break;
+			
+		if ( allPacketsAcked )
+			break;
+		
+		unsigned char packet[256];
+		for ( unsigned int i = 0; i < sizeof(packet); ++i )
+			packet[i] = (unsigned char) i;
+		
+		server.SendPacket( packet, sizeof(packet) );
+		client.SendPacket( packet, sizeof(packet) );
+		
+		while ( true )
+		{
+			unsigned char packet[256];
+			int bytes_read = client.ReceivePacket( packet, sizeof(packet) );
+			if ( bytes_read == 0 )
+				break;
+			check( bytes_read == sizeof(packet) );
+			for ( unsigned int i = 0; i < sizeof(packet); ++i )
+				check( packet[i] == (unsigned char) i );
+		}
+
+		while ( true )
+		{
+			unsigned char packet[256];
+			int bytes_read = server.ReceivePacket( packet, sizeof(packet) );
+			if ( bytes_read == 0 )
+				break;
+			check( bytes_read == sizeof(packet) );
+			for ( unsigned int i = 0; i < sizeof(packet); ++i )
+				check( packet[i] == (unsigned char) i );
+		}
+		
+		int ack_count = 0;
+		unsigned int * acks = NULL;
+		client.GetReliabilitySystem().GetAcks( &acks, ack_count );
+    CHECK_ACKS
+		for ( int i = 0; i < ack_count; ++i )
+		{
+			unsigned int ack = acks[i];
+			if ( ack < PacketCount )
+			{
+				check( clientAckedPackets[ack] == false );
+				clientAckedPackets[ack] = true;
+			}
+		}
+
+		server.GetReliabilitySystem().GetAcks( &acks, ack_count );
+		CHECK_ACKS
+		for ( int i = 0; i < ack_count; ++i )
+		{
+			unsigned int ack = acks[i];
+			if ( ack < PacketCount )
+			{
+				check( serverAckedPackets[ack] == false );
+				serverAckedPackets[ack] = true;
+			}
+		}
+		
+		unsigned int clientAckCount = 0;
+		unsigned int serverAckCount = 0;
+		for ( unsigned int i = 0; i < PacketCount; ++i )
+		{
+ 			clientAckCount += clientAckedPackets[i];
+ 			serverAckCount += serverAckedPackets[i];
+		}
+		allPacketsAcked = clientAckCount == PacketCount && serverAckCount == PacketCount;
+		
+		client.Update( DeltaTime );
+		server.Update( DeltaTime );
+	}
+	
+	check( client.IsConnected() );
+	check( server.IsConnected() );
+}
+
+void test_ack_bits()
+{
+	printf( "-----------------------------------------------------\n" );
+	printf( "test ack bits\n" );
+	printf( "-----------------------------------------------------\n" );
+
+	const int ServerPort = 30000;
+	const int ClientPort = 30001;
+	const int ProtocolId = 0x11112222;
+	const float DeltaTime = 0.001f;
+	const float TimeOut = 0.1f;
+	const unsigned int PacketCount = 100;
+	
+	ReliableConnection client( ProtocolId, TimeOut );
+	ReliableConnection server( ProtocolId, TimeOut );
+	
+	check( client.Start( ClientPort ) );
+	check( server.Start( ServerPort ) );
+	
+	client.Connect( Address(127,0,0,1,ServerPort ) );
+	server.Listen();
+		
+	bool clientAckedPackets[PacketCount];
+	bool serverAckedPackets[PacketCount];
+	for ( unsigned int i = 0; i < PacketCount; ++i )
+	{
+		clientAckedPackets[i] = false;
+		serverAckedPackets[i] = false;
+	}
+	
+	bool allPacketsAcked = false;
+
+	while ( true )
+	{
+		if ( !client.IsConnecting() && client.ConnectFailed() )
+			break;
+			
+		if ( allPacketsAcked )
+			break;
+		
+		unsigned char packet[256];
+		for ( unsigned int i = 0; i < sizeof(packet); ++i )
+			packet[i] = (unsigned char) i;
+
+		for ( int i = 0; i < 10; ++i )
+		{
+			client.SendPacket( packet, sizeof(packet) );
+			
+			while ( true )
+			{
+				unsigned char packet[256];
+				int bytes_read = client.ReceivePacket( packet, sizeof(packet) );
+				if ( bytes_read == 0 )
+					break;
+				check( bytes_read == sizeof(packet) );
+				for ( unsigned int i = 0; i < sizeof(packet); ++i )
+					check( packet[i] == (unsigned char) i );
+			}
+
+			int ack_count = 0;
+			unsigned int * acks = NULL;
+			client.GetReliabilitySystem().GetAcks( &acks, ack_count );
+			CHECK_ACKS
+			for ( int i = 0; i < ack_count; ++i )
+			{
+				unsigned int ack = acks[i];
+				if ( ack < PacketCount )
+				{
+					check( !clientAckedPackets[ack] );
+					clientAckedPackets[ack] = true;
+				}
+			}
+
+			client.Update( DeltaTime * 0.1f );
+		}
+		
+		server.SendPacket( packet, sizeof(packet) );
+
+		while ( true )
+		{
+			unsigned char packet[256];
+			int bytes_read = server.ReceivePacket( packet, sizeof(packet) );
+			if ( bytes_read == 0 )
+				break;
+			check( bytes_read == sizeof(packet) );
+			for ( unsigned int i = 0; i < sizeof(packet); ++i )
+				check( packet[i] == (unsigned char) i );
+		}
+
+		int ack_count = 0;
+		unsigned int * acks = NULL;
+		server.GetReliabilitySystem().GetAcks( &acks, ack_count );
+    CHECK_ACKS
+		for ( int i = 0; i < ack_count; ++i )
+		{
+			unsigned int ack = acks[i];
+			if ( ack < PacketCount )
+			{
+				check( !serverAckedPackets[ack] );
+				serverAckedPackets[ack] = true;
+			}
+		}
+		
+		unsigned int clientAckCount = 0;
+		unsigned int serverAckCount = 0;
+		for ( unsigned int i = 0; i < PacketCount; ++i )
+		{
+			if ( clientAckedPackets[i] )
+				clientAckCount++;
+			if ( serverAckedPackets[i] )
+				serverAckCount++;
+		}
+//		printf( "client ack count = %d, server ack count = %d\n", clientAckCount, serverAckCount );
+		allPacketsAcked = clientAckCount == PacketCount && serverAckCount == PacketCount;
+		
+		server.Update( DeltaTime );
+	}
+	
+	check( client.IsConnected() );
+	check( server.IsConnected() );
+}
+
+void test_packet_loss()
+{
+	printf( "-----------------------------------------------------\n" );
+	printf( "test packet loss\n" );
+	printf( "-----------------------------------------------------\n" );
+
+	const int ServerPort = 30000;
+	const int ClientPort = 30001;
+	const int ProtocolId = 0x11112222;
+	const float DeltaTime = 0.001f;
+	const float TimeOut = 0.1f;
+	const unsigned int PacketCount = 100;
+	
+	ReliableConnection client( ProtocolId, TimeOut );
+	ReliableConnection server( ProtocolId, TimeOut );
+	
+	client.SetPacketLossMask( 1 );
+	server.SetPacketLossMask( 1 );
+	
+	check( client.Start( ClientPort ) );
+	check( server.Start( ServerPort ) );
+	
+	client.Connect( Address(127,0,0,1,ServerPort ) );
+	server.Listen();
+		
+	bool clientAckedPackets[PacketCount];
+	bool serverAckedPackets[PacketCount];
+	for ( unsigned int i = 0; i < PacketCount; ++i )
+	{
+		clientAckedPackets[i] = false;
+		serverAckedPackets[i] = false;
+	}
+	
+	bool allPacketsAcked = false;
+
+	while ( true )
+	{
+		if ( !client.IsConnecting() && client.ConnectFailed() )
+			break;
+			
+		if ( allPacketsAcked )
+			break;
+		
+		unsigned char packet[256];
+		for ( unsigned int i = 0; i < sizeof(packet); ++i )
+			packet[i] = (unsigned char) i;
+
+		for ( int i = 0; i < 10; ++i )
+		{
+			client.SendPacket( packet, sizeof(packet) );
+			
+			while ( true )
+			{
+				unsigned char packet[256];
+				int bytes_read = client.ReceivePacket( packet, sizeof(packet) );
+				if ( bytes_read == 0 )
+					break;
+				check( bytes_read == sizeof(packet) );
+				for ( unsigned int i = 0; i < sizeof(packet); ++i )
+					check( packet[i] == (unsigned char) i );
+			}
+
+			int ack_count = 0;
+			unsigned int * acks = NULL;
+			client.GetReliabilitySystem().GetAcks( &acks, ack_count );
+      CHECK_ACKS
+			for ( int i = 0; i < ack_count; ++i )
+			{
+				unsigned int ack = acks[i];
+				if ( ack < PacketCount )
+				{
+					check( !clientAckedPackets[ack] );
+					check ( ( ack & 1 ) == 0 );
+					clientAckedPackets[ack] = true;
+				}
+			}
+
+			client.Update( DeltaTime * 0.1f );
+		}
+		
+		server.SendPacket( packet, sizeof(packet) );
+
+		while ( true )
+		{
+			unsigned char packet[256];
+			int bytes_read = server.ReceivePacket( packet, sizeof(packet) );
+			if ( bytes_read == 0 )
+				break;
+			check( bytes_read == sizeof(packet) );
+			for ( unsigned int i = 0; i < sizeof(packet); ++i )
+				check( packet[i] == (unsigned char) i );
+		}
+
+		int ack_count = 0;
+		unsigned int * acks = NULL;
+		server.GetReliabilitySystem().GetAcks( &acks, ack_count );
+    CHECK_ACKS
+		for ( int i = 0; i < ack_count; ++i )
+		{
+			unsigned int ack = acks[i];
+			if ( ack < PacketCount )
+			{
+				check( !serverAckedPackets[ack] );
+				check( ( ack & 1 ) == 0 );
+				serverAckedPackets[ack] = true;
+			}
+		}
+		
+		unsigned int clientAckCount = 0;
+		unsigned int serverAckCount = 0;
+		for ( unsigned int i = 0; i < PacketCount; ++i )
+		{
+			if ( ( i & 1 ) != 0 )
+			{
+				check( clientAckedPackets[i] == false );
+				check( serverAckedPackets[i] == false );
+			}
+			if ( clientAckedPackets[i] )
+				clientAckCount++;
+			if ( serverAckedPackets[i] )
+				serverAckCount++;
+		}
+		allPacketsAcked = clientAckCount == PacketCount / 2 && serverAckCount == PacketCount / 2;
+		
+		server.Update( DeltaTime );
+	}
+	
+	check( client.IsConnected() );
+	check( server.IsConnected() );
+}
+
+void test_sequence_wrap_around()
+{
+	printf( "-----------------------------------------------------\n" );
+	printf( "test sequence wrap around\n" );
+	printf( "-----------------------------------------------------\n" );
+
+	const int ServerPort = 30000;
+	const int ClientPort = 30001;
+	const int ProtocolId = 0x11112222;
+	const float DeltaTime = 0.05f;
+	const float TimeOut = 1000.0f;
+	const unsigned int PacketCount = 256;
+	const unsigned int MaxSequence = 31;		// [0,31]
+
+	ReliableConnection client( ProtocolId, TimeOut, MaxSequence );
+	ReliableConnection server( ProtocolId, TimeOut, MaxSequence );
+
+	check( client.Start( ClientPort ) );
+	check( server.Start( ServerPort ) );
+
+	client.Connect( Address(127,0,0,1,ServerPort ) );
+	server.Listen();
+
+	unsigned int clientAckCount[MaxSequence+1];
+	unsigned int serverAckCount[MaxSequence+1];
+	for ( unsigned int i = 0; i <= MaxSequence; ++i )
+	{
+		clientAckCount[i] = 0;
+		serverAckCount[i] = 0;
+	}
+
+	bool allPacketsAcked = false;
+
+	while ( true )
+	{
+		if ( !client.IsConnecting() && client.ConnectFailed() )
+			break;
+
+		if ( allPacketsAcked )
+			break;
+
+		unsigned char packet[256];
+		for ( unsigned int i = 0; i < sizeof(packet); ++i )
+			packet[i] = (unsigned char) i;
+
+		server.SendPacket( packet, sizeof(packet) );
+		client.SendPacket( packet, sizeof(packet) );
+
+		while ( true )
+		{
+			unsigned char packet[256];
+			int bytes_read = client.ReceivePacket( packet, sizeof(packet) );
+			if ( bytes_read == 0 )
+				break;
+			check( bytes_read == sizeof(packet) );
+			for ( unsigned int i = 0; i < sizeof(packet); ++i )
+				check( packet[i] == (unsigned char) i );
+		}
+
+		while ( true )
+		{
+			unsigned char packet[256];
+			int bytes_read = server.ReceivePacket( packet, sizeof(packet) );
+			if ( bytes_read == 0 )
+				break;
+			check( bytes_read == sizeof(packet) );
+			for ( unsigned int i = 0; i < sizeof(packet); ++i )
+				check( packet[i] == (unsigned char) i );
+		}
+
+		int ack_count = 0;
+		unsigned int * acks = NULL;
+		client.GetReliabilitySystem().GetAcks( &acks, ack_count );
+    CHECK_ACKS
+		for ( int i = 0; i < ack_count; ++i )
+		{
+			unsigned int ack = acks[i];
+			check( ack <= MaxSequence );
+			clientAckCount[ack] += 1;
+		}
+
+		server.GetReliabilitySystem().GetAcks( &acks, ack_count );
+    CHECK_ACKS
+		for ( int i = 0; i < ack_count; ++i )
+		{
+			unsigned int ack = acks[i];
+			check( ack <= MaxSequence );
+			serverAckCount[ack]++;
+		}
+
+		unsigned int totalClientAcks = 0;
+		unsigned int totalServerAcks = 0;
+		for ( unsigned int i = 0; i <= MaxSequence; ++i )
+		{
+ 			totalClientAcks += clientAckCount[i];
+ 			totalServerAcks += serverAckCount[i];
+		}
+		allPacketsAcked = totalClientAcks >= PacketCount && totalServerAcks >= PacketCount;
+
+		// note: test above is not very specific, we can do better...
+
+		client.Update( DeltaTime );
+		server.Update( DeltaTime );
+	}
+
+	check( client.IsConnected() );
+	check( server.IsConnected() );
+}
+
+void tests()
+{
+	test_packet_queue();
+	test_reliability_system();
+	test_join();
+	test_join_timeout();
+	test_join_busy();
+	test_rejoin();
+	test_payload();
+	test_acks();
+	test_ack_bits();
+	test_packet_loss();
+	test_sequence_wrap_around();
+
+	printf( "-----------------------------------------------------\n" );
+	printf( "passed!\n" );
+}
+
+int main( int argc, char * argv[] )
+{
+	if ( !InitializeSockets() )
+	{
+		printf( "failed to initialize sockets\n" );
+		return 1;
+	}
+	
+	tests();
+	
 	ShutdownSockets();
 
 	return 0;
